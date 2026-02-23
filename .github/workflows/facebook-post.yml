@@ -1,9 +1,9 @@
-name: RobCo FB Post
+name: RobCo Social Post
 
 on:
-  workflow_dispatch: {}   # allows manual run
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 12 * * *"  # daily at 12:00 UTC (we can adjust later)
+    - cron: "0 12 * * *"
 
 jobs:
   post:
@@ -15,9 +15,11 @@ jobs:
         with:
           node-version: 20
 
-      - name: Post to Facebook
+      - name: Post to Facebook (and Instagram when IMAGE_URL is set)
         run: node post_to_facebook.js
         env:
           META_SYSTEM_TOKEN: ${{ secrets.META_SYSTEM_TOKEN }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          POST_MESSAGE: "RobCo Weather Watch — GitHub automation test ✅"
+          POST_MESSAGE: "RobCo Weather Watch — automation run ✅"
+          FB_TEXT_POST: "true"
+          IMAGE_URL: ""   # leave blank for now; fill later when hosting is ready
