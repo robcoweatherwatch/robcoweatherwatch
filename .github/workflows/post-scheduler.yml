@@ -18,16 +18,17 @@ jobs:
 
       - name: Check for scheduled posts and publish
         env:
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          META_SYSTEM_TOKEN: ${{ secrets.META_SYSTEM_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
         run: |
           python3 << 'PYEOF'
           import os, json, base64, time, glob, subprocess
           from datetime import datetime, timezone
           import urllib.request, urllib.parse
 
-          PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN","").strip()
+          SYSTEM_TOKEN = os.environ.get("META_SYSTEM_TOKEN","").strip()
+          PAGE_ID = os.environ.get("FB_PAGE_ID","").strip()
+
           API = "https://graph.facebook.com/v21.0"
           NOW = datetime.now(timezone.utc)
 
@@ -71,6 +72,22 @@ jobs:
               subprocess.run(["git", "commit", "-m", f"Published and removed {filepath}"], check=True)
               subprocess.run(["git", "push"], check=True)
 
+          def get_page_access_token():
+              # Get a Page Access Token via System User token
+              url = f"{API}/{PAGE_ID}?fields=access_token&access_token={urllib.parse.quote(SYSTEM_TOKEN)}"
+              data = api_get(url)
+              token = data.get("access_token","")
+              if not token:
+                  raise Exception("Failed to fetch Page access_token. Response: " + json.dumps(data))
+              return token
+
+          if not SYSTEM_TOKEN or not PAGE_ID:
+              print("ERROR: Missing META_SYSTEM_TOKEN or FB_PAGE_ID secrets.")
+              raise SystemExit(1)
+
+          page_token = get_page_access_token()
+          print("Got Page token via system token.")
+
           # Find all scheduled post files
           post_files = glob.glob("scheduled-posts/*.json")
           if not post_files:
@@ -89,10 +106,6 @@ jobs:
                       continue
 
                   print(f"POSTING {filepath} — was scheduled for {scheduled_at}")
-
-                  if not PAGE_TOKEN:
-                      print("ERROR: FB_PAGE_TOKEN secret not set in GitHub repo.")
-                      continue
 
                   caption  = post.get("caption","")
                   do_fb    = post.get("platforms",{}).get("facebook", True)
@@ -115,28 +128,12 @@ jobs:
                   else:
                       print(f"Using image_url: {image_url}")
 
-                  # ── Resolve page ID ──
-                  accounts_url = f"{API}/me/accounts?fields=id,name,access_token&access_token={PAGE_TOKEN}"
-                  accounts = api_get(accounts_url)
-                  pages = accounts.get("data", [])
-                  if not pages:
-                      print("ERROR: No pages found for this token.")
-                      continue
-
-                  page = next(
-                      (p for p in pages if "robco" in p.get("name","").lower() or "weather" in p.get("name","").lower()),
-                      pages[0]
-                  )
-                  page_id    = page["id"]
-                  page_token = page.get("access_token", PAGE_TOKEN)
-                  print(f"Page: {page.get('name','(unknown)')} ({page_id})")
-
                   # ── Facebook ──
                   if do_fb:
                       try:
                           if image_url:
                               result = api_post(
-                                  f"{API}/{page_id}/photos",
+                                  f"{API}/{PAGE_ID}/photos",
                                   data={
                                       "url": image_url,
                                       "caption": caption,
@@ -146,7 +143,7 @@ jobs:
                               )
                           else:
                               result = api_post(
-                                  f"{API}/{page_id}/photos",
+                                  f"{API}/{PAGE_ID}/photos",
                                   data={"message": caption, "published": "true", "access_token": page_token},
                                   files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
                               )
@@ -163,19 +160,17 @@ jobs:
                   # ── Instagram ──
                   if do_ig:
                       try:
-                          # Need IG business account ID from the page
-                          page_data = api_get(f"{API}/{page_id}?fields=instagram_business_account&access_token={page_token}")
+                          page_data = api_get(f"{API}/{PAGE_ID}?fields=instagram_business_account&access_token={page_token}")
                           ig_id = page_data.get("instagram_business_account",{}).get("id")
                           if not ig_id:
                               print("IG: No Instagram Business account linked")
                           else:
-                              # IG requires a publicly reachable image_url.
                               ig_image_url = image_url
 
                               if not ig_image_url:
                                   # Legacy fallback: upload unpublished to FB to get a public source URL
                                   photo_res = api_post(
-                                      f"{API}/{page_id}/photos",
+                                      f"{API}/{PAGE_ID}/photos",
                                       data={"published": "false", "access_token": page_token},
                                       files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
                                   )
