@@ -1,0 +1,23 @@
+name: RobCo FB Post
+
+on:
+  workflow_dispatch: {}   # allows manual run
+  schedule:
+    - cron: "0 12 * * *"  # daily at 12:00 UTC (we can adjust later)
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Post to Facebook
+        run: node post_to_facebook.js
+        env:
+          META_SYSTEM_TOKEN: ${{ secrets.META_SYSTEM_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          POST_MESSAGE: "RobCo Weather Watch — GitHub automation test ✅"
