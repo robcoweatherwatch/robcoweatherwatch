@@ -1,0 +1,188 @@
+name: RobCo Weather Watch — Post Scheduler
+
+on:
+  schedule:
+    # Runs every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  post-scheduled:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to delete post files after publishing
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Check for scheduled posts and publish
+        env:
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, base64, time, glob, subprocess
+          from datetime import datetime, timezone
+          import urllib.request, urllib.parse, urllib.error
+
+          PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN","")
+          API = "https://graph.facebook.com/v21.0"
+          NOW = datetime.now(timezone.utc)
+
+          def api_post(url, data=None, files=None):
+              if files:
+                  import http.client, mimetypes
+                  boundary = "----RobCoFormBoundary" + str(int(time.time()))
+                  body = b""
+                  for k, v in (data or {}).items():
+                      body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+                  for k, (fname, fdata, ftype) in files.items():
+                      body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fname}\"\r\nContent-Type: {ftype}\r\n\r\n".encode()
+                      body += fdata + b"\r\n"
+                  body += f"--{boundary}--\r\n".encode()
+                  parsed = urllib.parse.urlparse(url)
+                  conn = http.client.HTTPSConnection(parsed.netloc)
+                  conn.request("POST", parsed.path + ("?" + parsed.query if parsed.query else ""),
+                               body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+                  resp = conn.getresponse()
+                  return json.loads(resp.read())
+              else:
+                  encoded = urllib.parse.urlencode(data or {}).encode()
+                  req = urllib.request.Request(url, data=encoded, method="POST")
+                  req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read())
+
+          def api_get(url):
+              with urllib.request.urlopen(url) as resp:
+                  return json.loads(resp.read())
+
+          def delete_post_file(filepath):
+              subprocess.run(["git", "config", "user.email", "action@github.com"], check=True)
+              subprocess.run(["git", "config", "user.name",  "GitHub Action"],      check=True)
+              subprocess.run(["git", "rm", filepath], check=True)
+              subprocess.run(["git", "commit", "-m", f"Published and removed {filepath}"], check=True)
+              subprocess.run(["git", "push"], check=True)
+
+          # Find all scheduled post files
+          post_files = glob.glob("scheduled-posts/*.json")
+          if not post_files:
+              print("No scheduled posts found.")
+              exit(0)
+
+          for filepath in post_files:
+              try:
+                  with open(filepath) as f:
+                      post = json.load(f)
+
+                  scheduled_at = datetime.fromisoformat(post["scheduled_at"].replace("Z","+00:00"))
+
+                  if scheduled_at > NOW:
+                      remaining = (scheduled_at - NOW).total_seconds() / 60
+                      print(f"SKIP {filepath} — scheduled in {remaining:.1f} min")
+                      continue
+
+                  print(f"POSTING {filepath} — was scheduled for {scheduled_at}")
+
+                  if not PAGE_TOKEN:
+                      print("ERROR: FB_PAGE_TOKEN secret not set in GitHub repo.")
+                      continue
+
+                  # Decode image
+                  image_b64 = post.get("image_jpeg_b64","")
+                  if not image_b64:
+                      print(f"ERROR: No image in {filepath}")
+                      continue
+                  image_bytes = base64.b64decode(image_b64)
+
+                  caption  = post.get("caption","")
+                  do_fb    = post.get("platforms",{}).get("facebook", True)
+                  do_ig    = post.get("platforms",{}).get("instagram", True)
+
+                  # ── Resolve page ID ──
+                  accounts_url = f"{API}/me/accounts?fields=id,name,access_token&access_token={PAGE_TOKEN}"
+                  accounts = api_get(accounts_url)
+                  pages = accounts.get("data", [])
+                  if not pages:
+                      print("ERROR: No pages found for this token.")
+                      continue
+                  page = next((p for p in pages if "robco" in p.get("name","").lower() or "weather" in p.get("name","").lower()), pages[0])
+                  page_id    = page["id"]
+                  page_token = page.get("access_token", PAGE_TOKEN)
+                  print(f"Page: {page['name']} ({page_id})")
+
+                  fb_post_url = None
+                  ig_ok = False
+
+                  # ── Facebook ──
+                  if do_fb:
+                      try:
+                          result = api_post(
+                              f"{API}/{page_id}/photos",
+                              data={"message": caption, "published": "true", "access_token": page_token},
+                              files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
+                          )
+                          if "error" in result:
+                              print(f"FB ERROR: {result['error']['message']}")
+                          else:
+                              post_id = result.get("post_id") or result.get("id","")
+                              fb_post_url = f"https://www.facebook.com/{post_id.replace('_','/posts/')}" if post_id else ""
+                              print(f"Facebook posted OK — {fb_post_url}")
+                      except Exception as e:
+                          print(f"Facebook exception: {e}")
+
+                  # ── Instagram ──
+                  if do_ig:
+                      try:
+                          # Upload unpublished photo to get public URL
+                          photo_res = api_post(
+                              f"{API}/{page_id}/photos",
+                              data={"published": "false", "access_token": page_token},
+                              files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
+                          )
+                          if "error" in photo_res:
+                              print(f"IG upload error: {photo_res['error']['message']}")
+                          else:
+                              photo_id = photo_res["id"]
+                              # Get public image URL
+                              img_data = api_get(f"{API}/{photo_id}?fields=images&access_token={page_token}")
+                              images = img_data.get("images", [])
+                              if not images:
+                                  print("IG: Could not get photo URL")
+                              else:
+                                  image_url = images[0]["source"]
+                                  # Get IG business account
+                                  page_data = api_get(f"{API}/{page_id}?fields=instagram_business_account&access_token={page_token}")
+                                  ig_id = page_data.get("instagram_business_account",{}).get("id")
+                                  if not ig_id:
+                                      print("IG: No Instagram Business account linked")
+                                  else:
+                                      # Create container
+                                      container = api_post(f"{API}/{ig_id}/media",
+                                          data={"image_url": image_url, "caption": caption, "access_token": page_token})
+                                      if "error" in container:
+                                          print(f"IG container error: {container['error']['message']}")
+                                      else:
+                                          time.sleep(2)
+                                          # Publish
+                                          pub = api_post(f"{API}/{ig_id}/media_publish",
+                                              data={"creation_id": container["id"], "access_token": page_token})
+                                          if "error" in pub:
+                                              print(f"IG publish error: {pub['error']['message']}")
+                                          else:
+                                              ig_ok = True
+                                              print(f"Instagram posted OK — media id: {pub.get('id')}")
+                      except Exception as e:
+                          print(f"Instagram exception: {e}")
+
+                  # ── Delete the post file after attempting ──
+                  delete_post_file(filepath)
+                  print(f"Removed {filepath}")
+
+              except Exception as e:
+                  print(f"ERROR processing {filepath}: {e}")
+
+          print("Done.")
+          PYEOF
