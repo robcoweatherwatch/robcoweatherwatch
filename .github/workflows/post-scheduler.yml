@@ -25,15 +25,15 @@ jobs:
           python3 << 'PYEOF'
           import os, json, base64, time, glob, subprocess
           from datetime import datetime, timezone
-          import urllib.request, urllib.parse, urllib.error
+          import urllib.request, urllib.parse
 
-          PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN","")
+          PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN","").strip()
           API = "https://graph.facebook.com/v21.0"
           NOW = datetime.now(timezone.utc)
 
           def api_post(url, data=None, files=None):
               if files:
-                  import http.client, mimetypes
+                  import http.client
                   boundary = "----RobCoFormBoundary" + str(int(time.time()))
                   body = b""
                   for k, v in (data or {}).items():
@@ -42,10 +42,15 @@ jobs:
                       body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fname}\"\r\nContent-Type: {ftype}\r\n\r\n".encode()
                       body += fdata + b"\r\n"
                   body += f"--{boundary}--\r\n".encode()
+
                   parsed = urllib.parse.urlparse(url)
                   conn = http.client.HTTPSConnection(parsed.netloc)
-                  conn.request("POST", parsed.path + ("?" + parsed.query if parsed.query else ""),
-                               body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+                  conn.request(
+                      "POST",
+                      parsed.path + ("?" + parsed.query if parsed.query else ""),
+                      body,
+                      {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+                  )
                   resp = conn.getresponse()
                   return json.loads(resp.read())
               else:
@@ -70,15 +75,14 @@ jobs:
           post_files = glob.glob("scheduled-posts/*.json")
           if not post_files:
               print("No scheduled posts found.")
-              exit(0)
+              raise SystemExit(0)
 
           for filepath in post_files:
               try:
-                  with open(filepath) as f:
+                  with open(filepath, "r", encoding="utf-8") as f:
                       post = json.load(f)
 
                   scheduled_at = datetime.fromisoformat(post["scheduled_at"].replace("Z","+00:00"))
-
                   if scheduled_at > NOW:
                       remaining = (scheduled_at - NOW).total_seconds() / 60
                       print(f"SKIP {filepath} — scheduled in {remaining:.1f} min")
@@ -90,16 +94,26 @@ jobs:
                       print("ERROR: FB_PAGE_TOKEN secret not set in GitHub repo.")
                       continue
 
-                  # Decode image
-                  image_b64 = post.get("image_jpeg_b64","")
-                  if not image_b64:
-                      print(f"ERROR: No image in {filepath}")
-                      continue
-                  image_bytes = base64.b64decode(image_b64)
-
                   caption  = post.get("caption","")
                   do_fb    = post.get("platforms",{}).get("facebook", True)
                   do_ig    = post.get("platforms",{}).get("instagram", True)
+
+                  # Prefer image_url (new tool). Fallback to legacy base64.
+                  image_url = (post.get("image_url") or "").strip()
+                  image_bytes = None
+                  if not image_url:
+                      image_b64 = post.get("image_jpeg_b64","")
+                      if not image_b64:
+                          print(f"ERROR: No image_url or image_jpeg_b64 in {filepath}")
+                          continue
+                      try:
+                          image_bytes = base64.b64decode(image_b64)
+                          print("Using legacy base64 image.")
+                      except Exception as e:
+                          print(f"ERROR: Bad base64 in {filepath}: {e}")
+                          continue
+                  else:
+                      print(f"Using image_url: {image_url}")
 
                   # ── Resolve page ID ──
                   accounts_url = f"{API}/me/accounts?fields=id,name,access_token&access_token={PAGE_TOKEN}"
@@ -108,24 +122,37 @@ jobs:
                   if not pages:
                       print("ERROR: No pages found for this token.")
                       continue
-                  page = next((p for p in pages if "robco" in p.get("name","").lower() or "weather" in p.get("name","").lower()), pages[0])
+
+                  page = next(
+                      (p for p in pages if "robco" in p.get("name","").lower() or "weather" in p.get("name","").lower()),
+                      pages[0]
+                  )
                   page_id    = page["id"]
                   page_token = page.get("access_token", PAGE_TOKEN)
-                  print(f"Page: {page['name']} ({page_id})")
-
-                  fb_post_url = None
-                  ig_ok = False
+                  print(f"Page: {page.get('name','(unknown)')} ({page_id})")
 
                   # ── Facebook ──
                   if do_fb:
                       try:
-                          result = api_post(
-                              f"{API}/{page_id}/photos",
-                              data={"message": caption, "published": "true", "access_token": page_token},
-                              files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
-                          )
+                          if image_url:
+                              result = api_post(
+                                  f"{API}/{page_id}/photos",
+                                  data={
+                                      "url": image_url,
+                                      "caption": caption,
+                                      "published": "true",
+                                      "access_token": page_token
+                                  }
+                              )
+                          else:
+                              result = api_post(
+                                  f"{API}/{page_id}/photos",
+                                  data={"message": caption, "published": "true", "access_token": page_token},
+                                  files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
+                              )
+
                           if "error" in result:
-                              print(f"FB ERROR: {result['error']['message']}")
+                              print(f"FB ERROR: {result['error'].get('message')}")
                           else:
                               post_id = result.get("post_id") or result.get("id","")
                               fb_post_url = f"https://www.facebook.com/{post_id.replace('_','/posts/')}" if post_id else ""
@@ -136,44 +163,53 @@ jobs:
                   # ── Instagram ──
                   if do_ig:
                       try:
-                          # Upload unpublished photo to get public URL
-                          photo_res = api_post(
-                              f"{API}/{page_id}/photos",
-                              data={"published": "false", "access_token": page_token},
-                              files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
-                          )
-                          if "error" in photo_res:
-                              print(f"IG upload error: {photo_res['error']['message']}")
+                          # Need IG business account ID from the page
+                          page_data = api_get(f"{API}/{page_id}?fields=instagram_business_account&access_token={page_token}")
+                          ig_id = page_data.get("instagram_business_account",{}).get("id")
+                          if not ig_id:
+                              print("IG: No Instagram Business account linked")
                           else:
-                              photo_id = photo_res["id"]
-                              # Get public image URL
-                              img_data = api_get(f"{API}/{photo_id}?fields=images&access_token={page_token}")
-                              images = img_data.get("images", [])
-                              if not images:
-                                  print("IG: Could not get photo URL")
-                              else:
-                                  image_url = images[0]["source"]
-                                  # Get IG business account
-                                  page_data = api_get(f"{API}/{page_id}?fields=instagram_business_account&access_token={page_token}")
-                                  ig_id = page_data.get("instagram_business_account",{}).get("id")
-                                  if not ig_id:
-                                      print("IG: No Instagram Business account linked")
+                              # IG requires a publicly reachable image_url.
+                              ig_image_url = image_url
+
+                              if not ig_image_url:
+                                  # Legacy fallback: upload unpublished to FB to get a public source URL
+                                  photo_res = api_post(
+                                      f"{API}/{page_id}/photos",
+                                      data={"published": "false", "access_token": page_token},
+                                      files={"source": ("forecast.jpg", image_bytes, "image/jpeg")}
+                                  )
+                                  if "error" in photo_res:
+                                      print(f"IG upload error: {photo_res['error'].get('message')}")
+                                      ig_image_url = None
                                   else:
-                                      # Create container
-                                      container = api_post(f"{API}/{ig_id}/media",
-                                          data={"image_url": image_url, "caption": caption, "access_token": page_token})
-                                      if "error" in container:
-                                          print(f"IG container error: {container['error']['message']}")
+                                      photo_id = photo_res["id"]
+                                      img_data = api_get(f"{API}/{photo_id}?fields=images&access_token={page_token}")
+                                      images = img_data.get("images", [])
+                                      if images:
+                                          ig_image_url = images[0].get("source")
+                                      if not ig_image_url:
+                                          print("IG: Could not get photo URL from legacy upload.")
+
+                              if not ig_image_url:
+                                  print("IG: No usable image URL. Skipping IG publish.")
+                              else:
+                                  container = api_post(
+                                      f"{API}/{ig_id}/media",
+                                      data={"image_url": ig_image_url, "caption": caption, "access_token": page_token}
+                                  )
+                                  if "error" in container:
+                                      print(f"IG container error: {container['error'].get('message')}")
+                                  else:
+                                      time.sleep(2)
+                                      pub = api_post(
+                                          f"{API}/{ig_id}/media_publish",
+                                          data={"creation_id": container["id"], "access_token": page_token}
+                                      )
+                                      if "error" in pub:
+                                          print(f"IG publish error: {pub['error'].get('message')}")
                                       else:
-                                          time.sleep(2)
-                                          # Publish
-                                          pub = api_post(f"{API}/{ig_id}/media_publish",
-                                              data={"creation_id": container["id"], "access_token": page_token})
-                                          if "error" in pub:
-                                              print(f"IG publish error: {pub['error']['message']}")
-                                          else:
-                                              ig_ok = True
-                                              print(f"Instagram posted OK — media id: {pub.get('id')}")
+                                          print(f"Instagram posted OK — media id: {pub.get('id')}")
                       except Exception as e:
                           print(f"Instagram exception: {e}")
 
